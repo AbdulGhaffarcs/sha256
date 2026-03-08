@@ -1,254 +1,166 @@
 import subprocess
+import hashlib
 import os
-import ctypes
-import json
+import random
+import tempfile
 import pytest
 
-SYSLOG = "/tmp/test_syslog"
-ENV = {**os.environ, "SYSLOG_PATH": SYSLOG}
+
+def _sha256(binary_data: bytes) -> str:
+    """Compute expected SHA-256 using Python hashlib as ground truth."""
+    return hashlib.sha256(binary_data).hexdigest()
 
 
-def _write_syslog(content):
-    with open(SYSLOG, "w") as f:
-        f.write(content)
-
-
-def _run_analyze():
-    return subprocess.run(
-        ["ruby", "/app/analyze.rb"],
-        capture_output=True, text=True, env=ENV
+def _run(data: bytes) -> str:
+    """Feed data to /app/sha256 via stdin and return stdout stripped."""
+    result = subprocess.run(
+        ["/app/sha256", "-"],
+        input=data,
+        capture_output=True
     )
+    assert result.returncode == 0, f"Binary exited non-zero: {result.stderr}"
+    return result.stdout.decode().strip()
 
 
-def test_files_exist():
-    """Verify engine.so, analyze.rb, and salt.txt were created by the agent."""
-    assert os.path.exists("/app/engine.so"),  "engine.so not found at /app/engine.so"
-    assert os.path.exists("/app/analyze.rb"), "analyze.rb not found at /app/analyze.rb"
-    assert os.path.exists("/app/salt.txt"),   "salt.txt not found at /app/salt.txt"
+def _run_file(data: bytes) -> str:
+    """Write data to a temp file, run /app/sha256 <file>, return stdout stripped."""
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        f.write(data)
+        path = f.name
+    try:
+        result = subprocess.run(
+            ["/app/sha256", path],
+            capture_output=True
+        )
+        assert result.returncode == 0, f"Binary exited non-zero: {result.stderr}"
+        return result.stdout.decode().strip()
+    finally:
+        os.unlink(path)
 
 
-def test_salt_file_value():
-    """Verify salt.txt contains the integer 7 on its first line."""
-    val = int(open("/app/salt.txt").read().strip())
-    assert val == 7, f"salt.txt must contain 7, got {val}"
+def test_binary_exists():
+    """Verify /app/sha256 binary was compiled and exists at the required path."""
+    assert os.path.exists("/app/sha256"), "/app/sha256 binary not found"
+    assert os.access("/app/sha256", os.X_OK), "/app/sha256 is not executable"
 
 
-def test_engine_built_with_rust():
+def test_no_crypto_lib():
     """
-    Verify engine.so was compiled by rustc and not a plain C compiler.
-    Uses 'strings' to detect rustc-specific markers always embedded by the
-    Rust compiler (rustc version strings, rust_metadata section).
+    Verify /app/sha256 does not dynamically link any cryptographic library.
+    The implementation must be from scratch — no OpenSSL, libgcrypt, libsodium.
     """
     result = subprocess.run(
-        ["strings", "/app/engine.so"],
+        ["ldd", "/app/sha256"],
         capture_output=True, text=True
     )
-    assert result.returncode == 0, f"strings failed: {result.stderr}"
-    has_rustc = any(
-        marker in result.stdout
-        for marker in ["rustc", "rust_metadata", "__rustc"]
-    )
-    assert has_rustc, (
-        "engine.so does not contain rustc compiler markers. "
-        "Build with `cargo build --release` and crate-type=[\"cdylib\"]."
-    )
-
-
-def test_symbols_exported():
-    """Verify all three FFI functions are exported from engine.so with C linkage via nm -D."""
-    result = subprocess.run(["nm", "-D", "/app/engine.so"], capture_output=True, text=True)
-    assert result.returncode == 0, f"nm failed: {result.stderr}"
-    for sym in ("count_pattern", "count_pattern_ci", "count_lines_with_pattern"):
-        assert sym in result.stdout, (
-            f"Symbol '{sym}' not found in engine.so exports. "
-            "Ensure it is #[no_mangle] pub extern \"C\"."
+    output = result.stdout.lower()
+    forbidden = ["libssl", "libcrypto", "libgcrypt", "libsodium", "libmbedcrypto"]
+    for lib in forbidden:
+        assert lib not in output, (
+            f"engine links against forbidden crypto library '{lib}'. "
+            "Implement SHA-256 from scratch without crypto libraries."
         )
 
 
-def test_analyze_rb_uses_ffi():
+def test_output_format():
+    """Verify output is exactly 64 lowercase hex characters followed by a newline."""
+    result = subprocess.run(["/app/sha256", "-"], input=b"test", capture_output=True)
+    assert result.returncode == 0
+    out = result.stdout.decode()
+    assert out.endswith("\n"), "Output must end with a newline"
+    hex_part = out.strip()
+    assert len(hex_part) == 64, f"Digest must be 64 hex chars, got {len(hex_part)}"
+    assert hex_part == hex_part.lower(), "Digest must be lowercase hex"
+    assert all(c in "0123456789abcdef" for c in hex_part), "Digest must be valid hex"
+
+
+def test_empty_input():
+    """Verify SHA-256 of empty input matches the NIST test vector."""
+    got = _run(b"")
+    assert got == _sha256(b""), f"Empty input: got {got}"
+
+
+def test_abc():
+    """Verify SHA-256 of 'abc' matches the NIST FIPS 180-4 test vector."""
+    got = _run(b"abc")
+    assert got == _sha256(b"abc"), f"'abc': got {got}"
+
+
+def test_nist_long_vector():
+    """Verify SHA-256 of the 448-bit NIST FIPS 180-4 test vector (56 bytes)."""
+    data = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+    got = _run(data)
+    assert got == _sha256(data), f"NIST long: got {got}"
+
+
+def test_55_byte_boundary():
     """
-    Use Ruby's built-in Ripper AST parser to verify analyze.rb structure:
-    requires fiddle, loads engine.so, declares all three FFI functions,
-    reads salt.txt, and does not invoke .scan/.count/.match on text in Ruby.
-    All checks are performed via Ripper.sexp AST traversal — no regex.
+    Verify SHA-256 of a 55-byte input (padding boundary edge case).
+    55 bytes + 0x80 + 8-byte length = exactly 64 bytes (one block, no overflow).
+    This is the last length that fits in a single block.
     """
-    ripper_script = r"""
-require 'ripper'
-require 'json'
-
-source = File.read('/app/analyze.rb')
-sexp   = Ripper.sexp(source)
-
-results = { parse_ok: !sexp.nil? }
-
-def walk(node, &block)
-  return unless node.is_a?(Array)
-  block.call(node)
-  node.each { |child| walk(child, &block) }
-end
-
-# Detect prohibited Ruby counting methods via AST :call nodes
-prohibited_calls = []
-walk(sexp) do |node|
-  if node[0] == :call
-    method_node = node[3]
-    if method_node.is_a?(Array) && method_node[0] == :@ident
-      name = method_node[1]
-      prohibited_calls << name if ['scan', 'count', 'match'].include?(name)
-    end
-  end
-end
-
-# Detect require statements via AST :command nodes
-require_args = []
-walk(sexp) do |node|
-  if node[0] == :command
-    cmd = node[1]
-    if cmd.is_a?(Array) && cmd[0] == :@ident && cmd[1] == 'require'
-      walk(node[2]) do |n|
-        require_args << n[1] if n.is_a?(Array) && n[0] == :@tstring_content
-      end
-    end
-  end
-end
-
-# Detect string literals referencing key paths via AST :@tstring_content nodes
-string_literals = []
-walk(sexp) do |node|
-  string_literals << node[1] if node.is_a?(Array) && node[0] == :@tstring_content
-end
-
-# Detect method identifiers (FFI extern declarations and calls) via :@ident nodes
-ident_names = []
-walk(sexp) do |node|
-  ident_names << node[1] if node.is_a?(Array) && node[0] == :@ident
-end
-
-results[:has_fiddle]                   = require_args.any? { |r| r.include?('fiddle') }
-results[:has_engine_so]                = string_literals.any? { |s| s.include?('/app/engine.so') }
-results[:has_salt_txt]                 = string_literals.any? { |s| s.include?('/app/salt.txt') }
-results[:has_count_pattern]            = ident_names.include?('count_pattern')
-results[:has_count_pattern_ci]         = ident_names.include?('count_pattern_ci')
-results[:has_count_lines_with_pattern] = ident_names.include?('count_lines_with_pattern')
-results[:no_ruby_counting]             = prohibited_calls.empty?
-results[:prohibited_calls]             = prohibited_calls
-
-puts results.to_json
-"""
-    result = subprocess.run(["ruby", "-e", ripper_script], capture_output=True, text=True)
-    assert result.returncode == 0, f"Ripper script failed: {result.stderr}"
-
-    checks = json.loads(result.stdout)
-    assert checks["parse_ok"],                      "analyze.rb is not valid Ruby"
-    assert checks["has_fiddle"],                    "analyze.rb must require 'fiddle'"
-    assert checks["has_engine_so"],                 "analyze.rb must reference '/app/engine.so'"
-    assert checks["has_salt_txt"],                  "analyze.rb must read from '/app/salt.txt'"
-    assert checks["has_count_pattern"],             "analyze.rb must call count_pattern via FFI"
-    assert checks["has_count_pattern_ci"],          "analyze.rb must call count_pattern_ci via FFI"
-    assert checks["has_count_lines_with_pattern"],  "analyze.rb must call count_lines_with_pattern via FFI"
-    assert checks["no_ruby_counting"], (
-        f"analyze.rb must not call .scan/.count/.match on text in Ruby "
-        f"(found: {checks['prohibited_calls']}). Delegate all counting to Rust."
-    )
+    data = b"x" * 55
+    got = _run(data)
+    assert got == _sha256(data), f"55-byte: got {got}"
 
 
-def test_ffi_enforced_at_runtime():
+def test_56_byte_boundary():
     """
-    Runtime proof that analyze.rb delegates all counting to engine.so via FFI.
-
-    Replaces /app/engine.so with a sentinel C library returning fixed values:
-      count_pattern=42, count_pattern_ci=99, count_lines_with_pattern=17
-    checksum = 42 XOR 99 XOR 17 = 88, salted exact = 42+7 = 49.
-    Expected output: 'exact=49 ci=99 lines=17 checksum=88'
-    A pure-Ruby implementation cannot produce these sentinel-derived values.
+    Verify SHA-256 of a 56-byte input (padding boundary edge case).
+    56 bytes forces the length field into a second block.
+    Many incorrect implementations fail here.
     """
-    sentinel_src = "/tmp/sentinel.c"
-    sentinel_so  = "/app/sentinel_engine.so"
-    with open(sentinel_src, "w") as f:
-        f.write(
-            '#include <stddef.h>\n'
-            'int count_pattern(const char *p, const char *t) { return 42; }\n'
-            'int count_pattern_ci(const char *p, const char *t) { return 99; }\n'
-            'int count_lines_with_pattern(const char *p, const char *t) { return 17; }\n'
-        )
-    compile = subprocess.run(
-        ["gcc", "-shared", "-fPIC", "-o", sentinel_so, sentinel_src],
-        capture_output=True, text=True
-    )
-    assert compile.returncode == 0, f"Failed to compile sentinel: {compile.stderr}"
-
-    backup = "/app/engine_backup.so"
-    subprocess.run(["cp", "-f", "/app/engine.so", backup], check=True)
-    subprocess.run(["cp", "-f", sentinel_so, "/app/engine.so"], check=True)
-    try:
-        _write_syslog("INFO: no errors here")
-        result = _run_analyze()
-        out = result.stdout.strip()
-        assert out == "exact=49 ci=99 lines=17 checksum=88", (
-            f"Expected 'exact=49 ci=99 lines=17 checksum=88' but got {out!r}. "
-            f"analyze.rb is not delegating to engine.so via FFI. stderr: {result.stderr}"
-        )
-    finally:
-        subprocess.run(["cp", "-f", backup, "/app/engine.so"], check=True)
+    data = b"x" * 56
+    got = _run(data)
+    assert got == _sha256(data), f"56-byte: got {got}"
 
 
-def test_zero_match_case():
-    """Verify output when syslog has no ERROR entries: exact=7 ci=0 lines=0 checksum=0."""
-    _write_syslog("INFO: all good\nDEBUG: nothing wrong\nWARN: minor issue")
-    result = _run_analyze()
-    out = result.stdout.strip()
-    assert out == "exact=7 ci=0 lines=0 checksum=0", (
-        f"Expected 'exact=7 ci=0 lines=0 checksum=0', got {out!r}\nstderr: {result.stderr}"
-    )
+def test_64_byte_boundary():
+    """
+    Verify SHA-256 of a 64-byte input (exactly one full block).
+    The padding and length must go into a second block.
+    """
+    data = b"a" * 64
+    got = _run(data)
+    assert got == _sha256(data), f"64-byte: got {got}"
 
 
-def test_salt_applied_to_exact_only():
-    """With 1 ERROR: exact_raw=1, salt=7 gives exact=8; ci=1, lines=1, checksum=1^1^1=1."""
-    _write_syslog("ERROR: single occurrence")
-    result = _run_analyze()
-    out = result.stdout.strip()
-    assert out == "exact=8 ci=1 lines=1 checksum=1", (
-        f"Expected 'exact=8 ci=1 lines=1 checksum=1', got {out!r}\nstderr: {result.stderr}"
-    )
+def test_multi_block():
+    """Verify SHA-256 of a 1000-byte input requiring multiple compression rounds."""
+    data = b"abcdefgh" * 125  # 1000 bytes
+    got = _run(data)
+    assert got == _sha256(data), f"1000-byte: got {got}"
 
 
-def test_functionality_mixed_case():
-    """Verify counts on mixed-case fixture: 2 exact, 4 ci, 3 lines, checksum=2^4^3=5."""
-    _write_syslog("ERROR: disk ERROR: full\nerror: lowercase\nError: mixed\nINFO: ok")
-    result = _run_analyze()
-    out = result.stdout.strip()
-    assert out == "exact=9 ci=4 lines=3 checksum=5", (
-        f"Expected 'exact=9 ci=4 lines=3 checksum=5', got {out!r}\nstderr: {result.stderr}"
+def test_binary_data():
+    """Verify SHA-256 handles arbitrary binary (non-ASCII) input correctly."""
+    data = bytes(range(256))  # all 256 byte values
+    got = _run(data)
+    assert got == _sha256(data), f"binary 0-255: got {got}"
+
+
+def test_random_inputs():
+    """Verify SHA-256 output matches hashlib for 10 random inputs of varying length."""
+    rng = random.Random(42)
+    for _ in range(10):
+        length = rng.randint(0, 500)
+        data = bytes(rng.randint(0, 255) for _ in range(length))
+        got = _run(data)
+        assert got == _sha256(data), f"random {length}-byte input failed: got {got}"
+
+
+def test_file_mode():
+    """Verify file mode (./sha256 <filepath>) produces the same digest as stdin mode."""
+    data = b"The quick brown fox jumps over the lazy dog"
+    stdin_result = _run(data)
+    file_result  = _run_file(data)
+    assert file_result == stdin_result, (
+        f"File mode and stdin mode disagree: file={file_result} stdin={stdin_result}"
     )
 
 
-def test_analyze_log_written():
-    """Verify analyze.rb appends '<unix_timestamp> | <result_line>' to /app/analyze.log."""
-    if os.path.exists("/app/analyze.log"):
-        os.remove("/app/analyze.log")
-    _write_syslog("ERROR: test\nerror: ci\nINFO: skip")
-    result = _run_analyze()
-    stdout_line = result.stdout.strip()
-
-    assert os.path.exists("/app/analyze.log"), \
-        "analyze.rb must create /app/analyze.log"
-    log_line = open("/app/analyze.log").read().strip().splitlines()[-1]
-    assert " | " in log_line, \
-        f"Log line must be '<timestamp> | <result>', got: {log_line!r}"
-    ts_str, logged_result = log_line.split(" | ", 1)
-    assert ts_str.strip().isdigit(), \
-        f"Timestamp must be a Unix integer, got: {ts_str!r}"
-    assert logged_result == stdout_line, \
-        f"Logged result must match stdout: '{logged_result}' != '{stdout_line}'"
-
-
-def test_null_pointer_guard():
-    """Verify all three Rust functions return -1 for null pointer inputs via ctypes."""
-    lib = ctypes.CDLL("/app/engine.so")
-    for fn_name in ("count_pattern", "count_pattern_ci", "count_lines_with_pattern"):
-        fn = getattr(lib, fn_name)
-        fn.restype = ctypes.c_int
-        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-        assert fn(None, None) == -1,     f"{fn_name}(null, null) must return -1"
-        assert fn(b"ERROR", None) == -1, f"{fn_name}(pattern, null) must return -1"
-        assert fn(None, b"text") == -1,  f"{fn_name}(null, text) must return -1"
+def test_file_mode_binary():
+    """Verify file mode correctly hashes a binary file with non-ASCII content."""
+    data = bytes(range(256)) * 4  # 1024 bytes of all byte values
+    got = _run_file(data)
+    assert got == _sha256(data), f"file mode binary: got {got}"

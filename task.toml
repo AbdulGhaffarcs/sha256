@@ -1,19 +1,23 @@
 version = "1.0"
+
 [metadata]
 author_name = "abdulghaffar_official"
 author_email = "abghaffar360@gmail.com"
 difficulty = "hard"
 category = "systems-engineering"
-tags = ["rust", "ruby", "ffi", "shared-libraries"]
-expert_time_estimate_min = 30
+tags = ["c", "cryptography", "sha256", "from-scratch", "binary"]
+expert_time_estimate_min = 25
 junior_time_estimate_min = 90
+
 [verifier]
-timeout_sec = 300.0
+timeout_sec = 60.0
+
 [agent]
-timeout_sec = 1800.0 
+timeout_sec = 1800.0
+
 [environment]
-build_timeout_sec = 900.0
-cpus = 2              
-memory_mb = 4096      
-storage_mb = 10240
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 2048
+storage_mb = 4096
 allow_internet = true
