@@ -1,7 +1,10 @@
 #!/bin/bash
-export PATH="/usr/bin:$PATH"
+export PATH="/usr/bin:/usr/local/bin:$PATH"
 
-cat > /tmp/sha256.c << 'CSRC'
+# Create XOR key file
+echo "07" > /app/xor_key
+
+cat > /tmp/sha256xor.c << 'CSRC'
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,8 +82,7 @@ static void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len) {
         uint32_t take = (len < space) ? (uint32_t)len : space;
         memcpy(ctx->buf + ctx->buf_len, data, take);
         ctx->buf_len += take;
-        data += take;
-        len  -= take;
+        data += take; len -= take;
         if (ctx->buf_len == 64) {
             sha256_compress(ctx, ctx->buf);
             ctx->buf_len = 0;
@@ -103,30 +105,41 @@ static void sha256_final(sha256_ctx *ctx, uint8_t digest[32]) {
     for (i = 0; i < 8; i++) {
         digest[i*4]   = (ctx->h[i]>>24)&0xff;
         digest[i*4+1] = (ctx->h[i]>>16)&0xff;
-        digest[i*4+2] = (ctx->h[i]>>8)&0xff;
-        digest[i*4+3] =  ctx->h[i]&0xff;
+        digest[i*4+2] = (ctx->h[i]>>8) &0xff;
+        digest[i*4+3] =  ctx->h[i]     &0xff;
     }
 }
 
+static uint8_t read_xor_key(void) {
+    FILE *f = fopen("/app/xor_key", "r");
+    if (!f) { fprintf(stderr, "cannot open /app/xor_key\n"); exit(1); }
+    unsigned int val = 0;
+    fscanf(f, "%02x", &val);
+    fclose(f);
+    return (uint8_t)val;
+}
+
 int main(int argc, char *argv[]) {
-    sha256_ctx ctx;
-    uint8_t buf[4096], digest[32];
-    FILE *f;
-    size_t n;
-    int i;
     if (argc < 2) { fprintf(stderr, "usage: sha256 <file|->\n"); return 1; }
-    f = (strcmp(argv[1], "-") == 0) ? stdin : fopen(argv[1], "rb");
+    uint8_t xor_key = read_xor_key();
+    FILE *f = (strcmp(argv[1], "-") == 0) ? stdin : fopen(argv[1], "rb");
     if (!f) { perror("open"); return 1; }
+    sha256_ctx ctx;
     sha256_init(&ctx);
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+    uint8_t buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < n; i++) buf[i] ^= xor_key;
         sha256_update(&ctx, buf, n);
+    }
     if (f != stdin) fclose(f);
+    uint8_t digest[32];
     sha256_final(&ctx, digest);
-    for (i = 0; i < 32; i++) printf("%02x", digest[i]);
+    for (int i = 0; i < 32; i++) printf("%02x", digest[i]);
     printf("\n");
     return 0;
 }
 CSRC
 
-gcc -O2 -Wall -o /app/sha256 /tmp/sha256.c
-rm -f /tmp/sha256.c
+gcc -O2 -Wall -o /app/sha256 /tmp/sha256xor.c
+rm -f /tmp/sha256xor.c
